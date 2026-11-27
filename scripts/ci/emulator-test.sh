@@ -118,17 +118,44 @@ else
   ACCEL="-accel off"
   note "KVM not available on this runner: emulator runs without acceleration (very slow; boot may time out)"
 fi
-echo "no" | avdmanager create avd -n darkrom -k "$SYSIMG_PKG" --force >/dev/null 2>&1 \
-  || { note "avdmanager create avd failed"; finish fail; }
-CFG="$HOME/.android/avd/darkrom.avd/config.ini"
-{
-  echo "hw.ramSize=3072"
-  echo "disk.dataPartition.size=4G"
-  echo "hw.keyboard=yes"
-  echo "hw.lcd.width=1080"
-  echo "hw.lcd.height=2400"
-  echo "hw.lcd.density=420"
-} >> "$CFG"
+# Write the AVD by hand (no avdmanager: fewer moving parts, and errors are visible).
+export ANDROID_AVD_HOME="$HOME/.android/avd"
+AVD_DIR="$ANDROID_AVD_HOME/darkrom.avd"
+rm -rf "$AVD_DIR" "$ANDROID_AVD_HOME/darkrom.ini"
+mkdir -p "$AVD_DIR"
+API_LEVEL="$(echo "$SYSIMG_PKG" | cut -d';' -f2)"
+TAG="$(echo "$SYSIMG_PKG" | cut -d';' -f3)"
+ABI="$(echo "$SYSIMG_PKG" | cut -d';' -f4)"
+cat > "$ANDROID_AVD_HOME/darkrom.ini" <<EOF
+avd.ini.encoding=UTF-8
+path=$AVD_DIR
+path.rel=avd/darkrom.avd
+target=$API_LEVEL
+EOF
+cat > "$AVD_DIR/config.ini" <<EOF
+AvdId=darkrom
+avd.ini.displayname=darkrom
+avd.ini.encoding=UTF-8
+abi.type=$ABI
+hw.cpu.arch=$ABI
+hw.cpu.ncore=$(( $(nproc) > 4 ? 4 : $(nproc) ))
+image.sysdir.1=$MODSYS/
+tag.id=$TAG
+target=$API_LEVEL
+PlayStore.enabled=false
+hw.ramSize=3072
+disk.dataPartition.size=4G
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.keyboard=yes
+hw.lcd.width=1080
+hw.lcd.height=2400
+hw.lcd.density=420
+hw.audioInput=no
+hw.audioOutput=no
+fastboot.forceColdBoot=yes
+EOF
+cp "$AVD_DIR/config.ini" "$RESULTS/avd-config.ini"
 
 # shellcheck disable=SC2086
 emulator -avd darkrom -sysdir "$MODSYS" -no-window -gpu swiftshader_indirect -no-snapshot \
