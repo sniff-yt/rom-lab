@@ -1,0 +1,4 @@
+# Optional: fix mode/owner/SELinux label of overlay files.
+# Format: <path on the phone> <mode> <uid> <gid> <selinux label>
+# Example (an executable script):
+# /system/bin/darkrom-hello 0755 0 2000 u:object_r:system_file:s0

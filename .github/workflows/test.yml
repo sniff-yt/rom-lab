@@ -1,0 +1,118 @@
+name: test
+
+# Builds DarkROM on top of Google's x86_64 emulator image, boots it headless
+# and publishes proof to the "test-latest" release.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SYSIMG_PKG: "system-images;android-34;google_apis;x86_64"
+  SYSIMG_REL: "system-images/android-34/google_apis/x86_64"
+  BOOT_TIMEOUT: "600"
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q e2fsprogs android-sdk-libsparse-utils erofs-utils attr
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h / /mnt || true
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "no /dev/kvm on this runner"
+
+      - name: Cache emulator system image
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sysimg-cache
+          key: sysimg-${{ env.SYSIMG_REL }}-v1
+
+      - name: Install SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null || true
+          "$SM" --install emulator platform-tools >/dev/null
+          if [ -d "$HOME/sysimg-cache/x86_64" ]; then
+            echo "using cached system image"
+            mkdir -p "$SDK/$(dirname "$SYSIMG_REL")"
+            rm -rf "${SDK:?}/$SYSIMG_REL"
+            cp -a "$HOME/sysimg-cache/x86_64" "$SDK/$SYSIMG_REL"
+          else
+            "$SM" --install "$SYSIMG_PKG" >/dev/null
+            mkdir -p "$HOME/sysimg-cache"
+            cp -a "$SDK/$SYSIMG_REL" "$HOME/sysimg-cache/x86_64"
+          fi
+          grep -E 'Pkg.Revision|AndroidVersion' "$SDK/$SYSIMG_REL/source.properties"
+          {
+            echo "$SDK/emulator"
+            echo "$SDK/platform-tools"
+            echo "$SDK/cmdline-tools/latest/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build, boot and check
+        run: |
+          WORK_ROOT=/mnt/darkrom
+          if ! sudo mkdir -p "$WORK_ROOT" 2>/dev/null; then WORK_ROOT="$RUNNER_TEMP/darkrom"; fi
+          sudo chown "$(id -u):$(id -g)" "$WORK_ROOT" 2>/dev/null || mkdir -p "$WORK_ROOT"
+          df -h "$WORK_ROOT"
+          SYSIMG_DIR="$SDK/$SYSIMG_REL" WORK_ROOT="$WORK_ROOT" RESULTS="$PWD/results" \
+            scripts/ci/emulator-test.sh
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: results/
+          if-no-files-found: warn
+
+      - name: Publish release test-latest
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ -f results/summary.md ] || { echo "# DarkROM test: FAIL (no summary produced)" > results/summary.md; }
+          gh release delete test-latest --yes --cleanup-tag 2>/dev/null || true
+          git push origin :refs/tags/test-latest 2>/dev/null || true
+          mapfile -t files < <(find results -maxdepth 1 -type f | sort)
+          gh release create test-latest --target "$GITHUB_SHA" --prerelease \
+            --title "test-latest ($(cat results/status 2>/dev/null || echo fail)) ${GITHUB_SHA::7}" \
+            --notes-file results/summary.md "${files[@]}"
+
+      - name: Fail the job if the test failed
+        if: always()
+        run: |
+          s="$(cat results/status 2>/dev/null || echo fail)"
+          echo "status: $s"
+          [ "$s" = pass ]

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Usage: scripts/repack <workdir> <output.img>
+#
+# Rebuilds the system image in the same shape as the input:
+#   - ext4: fsck, shrink to the minimum size (resize2fs -M)
+#   - erofs: mkfs.erofs (lz4hc) from the extracted tree
+#   - AVB footer (if the input had one): new hashtree footer, signed with
+#     $DARKROM_AVB_KEY or a key generated in <workdir>/keys/
+#   - emulator disk: system goes back into super, vbmeta is re-signed, and a
+#     matching VerifiedBootParams.textproto is written next to <output.img>
+#   - super image: system goes back into a copy of super
+# Output is a raw (non-sparse) image. Safe to re-run (output is replaced).
+set -euo pipefail
+. "$(dirname "$0")/lib/common.sh"
+
+[ $# -eq 2 ] || die "usage: $0 <workdir> <output.img>"
+load_state "$1"
+OUT="$(realpath -m "$2")"
+OUT_DIR="$(dirname "$OUT")"
+mkdir -p "$OUT_DIR"
+need python3 openssl
+NEW="$WORK/system.new.img"
+rm -f "$NEW"
+
+# 1. filesystem -------------------------------------------------------------
+if [ "$FS" = ext4 ]; then
+  need e2fsck resize2fs
+  set +e; e2fsck -fy "$FS_IMG" >/dev/null 2>&1; rc=$?; set -e
+  [ $rc -lt 4 ] || die "e2fsck found errors it could not fix (rc=$rc)"
+  cp --sparse=always "$FS_IMG" "$NEW"
+  resize2fs -M "$NEW" >/dev/null 2>&1 || die "resize2fs -M failed"
+  # resize2fs -M leaves the file long; cut it to the filesystem size
+  bc="$(dumpe2fs -h "$NEW" 2>/dev/null | sed -n 's/^Block count: *//p')"
+  bs="$(dumpe2fs -h "$NEW" 2>/dev/null | sed -n 's/^Block size: *//p')"
+  truncate -s $((bc * bs)) "$NEW"
+else
+  need mkfs.erofs
+  [ "$(id -u)" = 0 ] || die "erofs repack needs root; use sudo"
+  mkfs.erofs -zlz4hc "$NEW" "$ROOT_DIR" >/dev/null
+fi
+log "filesystem: $(( $(stat -c %s "$NEW") / 1048576 )) MiB"
+
+# 2. AVB footer ---------------------------------------------------------------
+KEY="${DARKROM_AVB_KEY:-}"
+if [ -z "$KEY" ]; then
+  KEY="$WORK/keys/darkrom_avb.pem"
+  if [ ! -f "$KEY" ]; then
+    mkdir -p "$WORK/keys"
+    openssl genrsa -out "$KEY" 4096 2>/dev/null
+  fi
+fi
+if [ "${AVB_FOOTER:-0}" = 1 ]; then
+  args=(--image "$NEW" --partition_name "$AVB_PARTITION" --hash_algorithm "$AVB_HASH_ALG"
+        --algorithm SHA256_RSA4096 --key "$KEY" --rollback_index "$AVB_ROLLBACK")
+  if [ -s "$WORK/avb.props" ]; then
+    while IFS= read -r p; do args+=(--prop "$p"); done < "$WORK/avb.props"
+  fi
+  if [ "$AVB_KIND" = hash ]; then
+    avbtool add_hash_footer --dynamic_partition_size "${args[@]}"
+  else
+    avbtool add_hashtree_footer --do_not_generate_fec "${args[@]}"
+  fi
+  log "re-signed AVB footer (hashtree, no FEC) with $(basename "$KEY")"
+fi
+
+# 3. container ---------------------------------------------------------------
+case "$IMG_KIND" in
+  image)
+    mv -f "$NEW" "$OUT"
+    ;;
+  super)
+    cp --sparse=always "$WORK/super.img" "$OUT.tmp"
+    lp replace "$OUT.tmp" system "$NEW"
+    mv -f "$OUT.tmp" "$OUT"
+    rm -f "$NEW"
+    ;;
+  emu-disk)
+    cp --sparse=always "$WORK/super.img" "$WORK/super.new.img"
+    lp replace "$WORK/super.new.img" system "$NEW"
+    lp info "$WORK/super.new.img" >&2
+    avbh resign-vbmeta "$WORK/vbmeta.orig.img" "$NEW" "$KEY" "$WORK/vbmeta.new.img" system
+    read -r VB_TOTAL VB_DIGEST < <(avbh digest "$WORK/vbmeta.new.img" "$NEW" system)
+    [ "$(stat -c %s "$WORK/vbmeta.new.img")" -le "$VBMETA_SIZE" ] || die "vbmeta too big"
+    cp --sparse=always "$ORIG_DISK" "$OUT.tmp"
+    # vbmeta partition: zero it, then write the new blob
+    dd if=/dev/zero of="$OUT.tmp" bs=4096 seek=$((VBMETA_OFF / 4096)) count=$((VBMETA_SIZE / 4096)) conv=notrunc status=none
+    dd if="$WORK/vbmeta.new.img" of="$OUT.tmp" bs=4096 seek=$((VBMETA_OFF / 4096)) conv=notrunc status=none
+    dd if="$WORK/super.new.img" of="$OUT.tmp" bs=1M seek=$((SUPER_OFF / 1048576)) conv=notrunc,sparse status=none
+    mv -f "$OUT.tmp" "$OUT"
+    cat > "$OUT_DIR/VerifiedBootParams.textproto" <<EOF
+# androidboot.vbmeta.size=$VB_TOTAL androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=$VB_DIGEST
+major_version: 2
+param: "androidboot.vbmeta.size=$VB_TOTAL"
+param: "androidboot.vbmeta.hash_alg=sha256"
+param: "androidboot.vbmeta.digest=$VB_DIGEST"
+EOF
+    rm -f "$NEW" "$WORK/super.new.img"
+    log "wrote $OUT_DIR/VerifiedBootParams.textproto (vbmeta digest $VB_DIGEST)"
+    ;;
+  *) die "unknown IMG_KIND $IMG_KIND" ;;
+esac
+log "done: $OUT ($(( $(stat -c %s "$OUT") / 1048576 )) MiB)"

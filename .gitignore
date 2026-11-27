@@ -1,0 +1,6 @@
+work/
+out/
+results/
+*.img
+*.zip
+*.pem

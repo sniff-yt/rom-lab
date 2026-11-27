@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Usage: scripts/unpack <input> <workdir>
+#
+# <input> can be:
+#   - a .zip (emulator system image zip, or a GSI zip) -> its system.img is used
+#   - an emulator system.img (GPT disk with "vbmeta" + "super" partitions)
+#   - a raw super.img (dynamic partitions; the "system" partition is used)
+#   - a plain system image: ext4 or erofs, sparse or raw, with or without an AVB footer
+#
+# Produces <workdir>/state.env plus either <workdir>/system.ext4 (edited in
+# place later with debugfs) or <workdir>/rootfs/ (erofs, extracted tree).
+# Re-running wipes and recreates <workdir>, so it is safe to repeat.
+set -euo pipefail
+. "$(dirname "$0")/lib/common.sh"
+
+[ $# -eq 2 ] || die "usage: $0 <input> <workdir>"
+INPUT="$(realpath "$1")"
+[ -f "$INPUT" ] || die "input not found: $INPUT"
+need python3 od dd e2fsck resize2fs debugfs dumpe2fs
+
+rm -rf "$2"
+mkdir -p "$2"
+WORK="$(cd "$2" && pwd)"
+STATE="$WORK/state.env"
+: > "$STATE"
+setv() { printf '%s=%q\n' "$1" "$2" >> "$STATE"; }
+
+SRC="$INPUT"
+setv INPUT "$INPUT"
+
+# 1. zip -> system.img (keep the whole extracted folder for repack)
+if [ "$(detect_kind "$SRC")" = zip ]; then
+  need unzip
+  log "unzipping $(basename "$SRC")"
+  unzip -q -o "$SRC" -d "$WORK/orig"
+  SRC="$(find "$WORK/orig" -name system.img -type f | head -n1)"
+  [ -n "$SRC" ] || die "no system.img inside zip"
+  setv ORIG_DIR "$(dirname "$SRC")"
+fi
+
+# 2. sparse -> raw
+WAS_SPARSE=0
+if [ "$(detect_kind "$SRC")" = sparse ]; then
+  need simg2img
+  log "sparse image -> raw (simg2img)"
+  simg2img "$SRC" "$WORK/raw.img"
+  SRC="$WORK/raw.img"
+  WAS_SPARSE=1
+fi
+setv WAS_SPARSE "$WAS_SPARSE"
+
+# 3. containers
+KIND="$(detect_kind "$SRC")"
+case "$KIND" in
+  gpt)
+    log "GPT disk (emulator layout): pulling out vbmeta + super"
+    read -r VB_OFF VB_SIZE < <(gpt find "$SRC" vbmeta)
+    read -r SU_OFF SU_SIZE < <(gpt find "$SRC" super)
+    dd if="$SRC" of="$WORK/vbmeta.orig.img" bs=4096 skip=$((VB_OFF / 4096)) count=$((VB_SIZE / 4096)) status=none
+    dd if="$SRC" of="$WORK/super.img" bs=1M skip=$((SU_OFF / 1048576)) count=$((SU_SIZE / 1048576)) conv=sparse status=none
+    [ "$(stat -c %s "$WORK/super.img")" -eq "$SU_SIZE" ] || die "super size mismatch (offsets not MiB aligned?)"
+    setv IMG_KIND emu-disk
+    setv ORIG_DISK "$SRC"
+    setv SUPER_OFF "$SU_OFF"
+    setv VBMETA_OFF "$VB_OFF"
+    setv VBMETA_SIZE "$VB_SIZE"
+    lp extract "$WORK/super.img" system "$WORK/system.part.img"
+    SRC="$WORK/system.part.img"
+    ;;
+  super)
+    log "raw super image: extracting the system partition"
+    cp --sparse=always "$SRC" "$WORK/super.img"
+    setv IMG_KIND super
+    lp extract "$WORK/super.img" system "$WORK/system.part.img"
+    SRC="$WORK/system.part.img"
+    ;;
+  ext4|erofs)
+    setv IMG_KIND image ;;
+  *) die "don't know how to unpack $(basename "$SRC") (kind: $KIND)" ;;
+esac
+
+# 4. AVB footer
+avbh footer-env "$SRC" > "$WORK/avb.env"
+# shellcheck disable=SC1091
+. "$WORK/avb.env"
+cat "$WORK/avb.env" >> "$STATE"
+if [ "$AVB_FOOTER" = 1 ]; then
+  avbh footer-props "$SRC" > "$WORK/avb.props"
+  log "AVB footer found (${AVB_KIND}, ${AVB_ALGORITHM}); it will be re-signed on repack"
+fi
+
+# 5. filesystem
+FS="$(detect_kind "$SRC")"
+setv FS "$FS"
+case "$FS" in
+  ext4)
+    if [ "$SRC" = "$WORK/system.part.img" ] || [ "$SRC" = "$WORK/raw.img" ]; then
+      mv "$SRC" "$WORK/system.ext4"
+    else
+      cp --sparse=always "$SRC" "$WORK/system.ext4"
+    fi
+    FS_IMG="$WORK/system.ext4"
+    if [ "$AVB_FOOTER" = 1 ]; then
+      avbtool erase_footer --image "$FS_IMG"
+    fi
+    # Room to work: +512 MiB. Shrunk back to the minimum on repack.
+    truncate -s "+512M" "$FS_IMG"
+    resize2fs -f "$FS_IMG" >/dev/null 2>&1 || die "resize2fs failed"
+    # Google images use read-only dedup (shared_blocks); e2fsprogs can only
+    # write after unsharing.
+    if dumpe2fs -h "$FS_IMG" 2>/dev/null | grep -q shared_blocks; then
+      log "unsharing deduplicated blocks"
+    fi
+    set +e
+    e2fsck -fy -E unshare_blocks "$FS_IMG" >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ $rc -lt 4 ] || die "e2fsck failed (rc=$rc)"
+    setv FS_IMG "$FS_IMG"
+    ;;
+  erofs)
+    need fsck.erofs getfattr setfattr
+    [ "$(id -u)" = 0 ] || die "erofs unpack needs root (to keep owners and SELinux labels); use sudo"
+    if [ "$AVB_FOOTER" = 1 ]; then
+      cp "$SRC" "$WORK/erofs.img"
+      avbtool erase_footer --image "$WORK/erofs.img"
+      SRC="$WORK/erofs.img"
+    fi
+    log "extracting erofs"
+    fsck.erofs --extract="$WORK/rootfs" --xattrs --preserve "$SRC" >/dev/null
+    rm -f "$WORK/erofs.img"
+    setv ROOT_DIR "$WORK/rootfs"
+    ;;
+  *) die "system partition is neither ext4 nor erofs ($FS)" ;;
+esac
+rm -f "$WORK/raw.img" "$WORK/system.part.img"
+
+# 6. where do /system files live? (system-as-root images keep them in /system)
+# shellcheck disable=SC1090
+. "$STATE"
+if fs_exists /system/build.prop; then
+  setv SYS_PREFIX /system
+elif fs_exists /build.prop; then
+  setv SYS_PREFIX ""
+else
+  die "no build.prop found at /system/build.prop or /build.prop"
+fi
+log "unpacked into $WORK ($(grep -E '^(IMG_KIND|FS)=' "$STATE" | tr '\n' ' '))"

@@ -1,0 +1,5 @@
+# Things to remove from the system partition.
+# Format: <path on the phone> [package name]
+# The package name is optional; when given, the test checks it is gone from
+# "pm list packages". Only /system/... paths work (not /product, /vendor).
+/system/app/EasterEgg com.android.egg

@@ -1,0 +1,7 @@
+# build.prop overrides: one key=value per line. Lines starting with # are ignored.
+# Existing keys in /system/build.prop are replaced; new keys are appended.
+# rom.json already adds ro.darkrom.name / ro.darkrom.version / ro.darkrom.description.
+# Note: a key also set in vendor/product build.prop may win over this one;
+# the test workflow reports any prop that did not stick.
+ro.product.marketname=DarkROM Test Device
+ro.darkrom.channel=cloud-test

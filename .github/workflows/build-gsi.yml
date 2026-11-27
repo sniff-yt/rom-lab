@@ -1,0 +1,126 @@
+name: build-gsi
+
+# Applies the same mods/ to Google's official arm64 GSI and publishes the
+# result to the "gsi-latest" release. Nothing here is flashed anywhere.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-gsi
+  cancel-in-progress: false
+
+env:
+  # Android 17 QPR1 (CP3A.260905.010), "ARM64" (no GMS) GSI, from
+  # https://developer.android.com/topic/generic-system-image/releases
+  GSI_URL: "https://dl.google.com/developers/android/cinnamonbun/images/gsi/aosp_arm64-exp-CP3A.260905.010-16176746-4a869a69.zip"
+  GSI_SHA256: "4a869a6959a50fee15ff871ce378853ced4485f2aa456eb64dbdbf7a2c0408aa"
+  GSI_NAME: "Android 17 QPR1 arm64 GSI (CP3A.260905.010)"
+
+jobs:
+  gsi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q e2fsprogs android-sdk-libsparse-utils erofs-utils attr xz-utils
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android
+          df -h / /mnt || true
+
+      - name: Cache GSI zip
+        uses: actions/cache@v4
+        with:
+          path: ~/gsi-cache
+          key: gsi-${{ env.GSI_SHA256 }}
+
+      - name: Download and verify GSI
+        run: |
+          set -euo pipefail
+          mkdir -p ~/gsi-cache
+          Z=~/gsi-cache/gsi.zip
+          if ! echo "$GSI_SHA256  $Z" | sha256sum -c - >/dev/null 2>&1; then
+            curl -fsSL --retry 3 -o "$Z" "$GSI_URL"
+          fi
+          echo "$GSI_SHA256  $Z" | sha256sum -c -
+
+      - name: Unpack, apply mods, repack
+        run: |
+          set -euo pipefail
+          W=/mnt/darkrom-gsi
+          if ! { sudo mkdir -p "$W" && sudo chown "$(id -u):$(id -g)" "$W"; }; then
+            W="$RUNNER_TEMP/darkrom-gsi"; mkdir -p "$W"
+          fi
+          echo "W=$W" >> "$GITHUB_ENV"
+          # sudo: needed only if the GSI uses erofs (to keep owners + SELinux labels)
+          sudo -E scripts/unpack ~/gsi-cache/gsi.zip "$W/wd"
+          sudo -E scripts/apply-mods "$W/wd" mods
+          sudo -E scripts/repack "$W/wd" "$W/out/system.img"
+          sudo chown -R "$(id -u):$(id -g)" "$W"
+          unzip -o -q ~/gsi-cache/gsi.zip vbmeta.img -d "$W/out"
+          python3 scripts/lib/avbtool.py info_image --image "$W/out/system.img" > "$W/out/system-avb-info.txt"
+          cp "$W/wd/applied.txt" "$W/out/applied.txt"
+
+      - name: Compress (split if over 2 GB)
+        run: |
+          set -euo pipefail
+          cd "$W/out"
+          xz -T0 -3 -v system.img
+          size=$(stat -c %s system.img.xz)
+          if [ "$size" -gt 2000000000 ]; then
+            split -b 1900M -d -a 2 system.img.xz system.img.xz.part
+            rm system.img.xz
+          fi
+          sha256sum ./* > SHA256SUMS
+          ls -l
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          cd "$W/out"
+          ver=$(python3 -c 'import json;print(json.load(open("'"$GITHUB_WORKSPACE"'/mods/rom.json")).get("version","?"))')
+          {
+            echo "# DarkROM GSI $ver (arm64)"
+            echo
+            echo "- Base: $GSI_NAME"
+            echo "- Commit: \`${GITHUB_SHA::12}\`"
+            echo "- Built by: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "**Not tested on hardware.** Only the x86_64 emulator build is boot-tested (release \`test-latest\`)."
+            echo "Needs an unlocked bootloader. Do not flash on a phone with a locked bootloader."
+            echo
+            echo "## Files"
+            echo "- \`system.img.xz\` (or \`.partNN\` pieces: \`cat system.img.xz.part* > system.img.xz\`), then \`xz -d system.img.xz\`"
+            echo "- \`vbmeta.img\`: Google's vbmeta from the same GSI zip (verification disabled)"
+            echo "- \`system-avb-info.txt\`, \`applied.txt\`, \`SHA256SUMS\`"
+            echo
+            echo "## Mods applied"
+            echo '```'
+            cat applied.txt
+            echo '```'
+          } > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release gsi-latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$W/out"
+          gh release delete gsi-latest --yes --cleanup-tag 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" push origin :refs/tags/gsi-latest 2>/dev/null || true
+          mapfile -t files < <(find . -maxdepth 1 -type f ! -name notes.md | sort)
+          gh release create gsi-latest --target "$GITHUB_SHA" --prerelease \
+            --title "gsi-latest ${GITHUB_SHA::7}" --notes-file notes.md "${files[@]}"

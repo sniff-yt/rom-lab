@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Usage: scripts/apply-mods <workdir> [mods_dir]   (mods_dir defaults to ./mods)
+#
+# Applies, in this order:
+#   1. mods/debloat.txt      remove paths from the system partition
+#   2. mods/apps/            add APKs as system apps / privileged apps
+#   3. mods/overlay/         copy files into /system (mirrors /system layout)
+#   4. mods/overlay-perms.txt  optional mode/owner/SELinux label fixes
+#   5. mods/rom.json + mods/props.txt   set build.prop values
+# Safe to run more than once on the same workdir (same result).
+# Writes <workdir>/expected-props.txt, expected-removed.txt,
+# expected-files.txt for the test workflow, and <workdir>/applied.txt.
+set -euo pipefail
+. "$(dirname "$0")/lib/common.sh"
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then die "usage: $0 <workdir> [mods_dir]"; fi
+load_state "$1"
+MODS="$(realpath "${2:-$(dirname "$0")/../mods}")"
+[ -d "$MODS" ] || die "mods dir not found: $MODS"
+need python3 debugfs
+P="$SYS_PREFIX"   # "/system" on system-as-root images
+APPLIED="$WORK/applied.txt"
+: > "$APPLIED"
+: > "$WORK/expected-removed.txt"
+: > "$WORK/expected-files.txt"
+
+# Strip comments/blank lines.
+clean() { sed -e 's/#.*$//' -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' "$1"; }
+
+# Map "/system/foo" (how the phone sees it) to the path inside the image.
+img_path() {
+  case "$1" in
+    /system/*) printf '%s%s\n' "$P" "${1#/system}" ;;
+    *) die "only /system/... paths are supported here (got $1). Other partitions (product, vendor, system_ext) are not modified." ;;
+  esac
+}
+
+# 1. debloat ---------------------------------------------------------------
+if [ -f "$MODS/debloat.txt" ]; then
+  while read -r path pkg _; do
+    ip="$(img_path "$path")"
+    if fs_exists "$ip"; then
+      fs_rm_rf "$ip"
+      echo "debloat: removed $path" >> "$APPLIED"
+    else
+      echo "debloat: $path already absent" >> "$APPLIED"
+    fi
+    printf '%s %s\n' "$path" "${pkg:--}" >> "$WORK/expected-removed.txt"
+  done < <(clean "$MODS/debloat.txt")
+fi
+
+# 2. apps --------------------------------------------------------------------
+for kind in system priv-app; do
+  dir="$MODS/apps/$kind"
+  [ -d "$dir" ] || continue
+  target=app
+  [ "$kind" = priv-app ] && target=priv-app
+  for apk in "$dir"/*.apk; do
+    [ -e "$apk" ] || continue
+    name="$(basename "$apk" .apk)"
+    dest="$P/$target/$name/$name.apk"
+    fs_mkdir_p "$P/$target/$name" "$DEFAULT_CTX"
+    fs_write "$apk" "$dest" 0644 0 0 "$DEFAULT_CTX"
+    echo "app: $kind/$name.apk -> /system/$target/$name/$name.apk" >> "$APPLIED"
+    printf '/system/%s/%s/%s.apk %s\n' "$target" "$name" "$name" "$(sha256sum "$apk" | cut -d' ' -f1)" >> "$WORK/expected-files.txt"
+  done
+done
+
+# 3. overlay -----------------------------------------------------------------
+if [ -d "$MODS/overlay" ]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#"$MODS/overlay"}"
+    case "$(basename "$rel")" in .gitkeep) continue ;; esac
+    mode=0644
+    [ -x "$f" ] && mode=0755
+    dest="$P$rel"
+    # existing files keep their owner/label; new ones get 0644/0755 root:root
+    if fs_exists "$dest"; then
+      fs_write "$f" "$dest" "$mode"
+    else
+      fs_write "$f" "$dest" "$mode" 0 0
+    fi
+    echo "overlay: /system$rel" >> "$APPLIED"
+    printf '/system%s %s\n' "$rel" "$(sha256sum "$f" | cut -d' ' -f1)" >> "$WORK/expected-files.txt"
+  done < <(find "$MODS/overlay" -type f -print0 | sort -z)
+fi
+
+# 4. overlay perms -----------------------------------------------------------
+if [ -f "$MODS/overlay-perms.txt" ]; then
+  while read -r path mode uid gid ctx _; do
+    [ -n "${ctx:-}" ] || die "overlay-perms.txt: need '<path> <mode> <uid> <gid> <selinux label>' (line for $path)"
+    fs_set_meta "$(img_path "$path")" "$mode" "$uid" "$gid" "$ctx"
+    echo "perms: $path $mode $uid:$gid $ctx" >> "$APPLIED"
+  done < <(clean "$MODS/overlay-perms.txt")
+fi
+
+# 5. props -------------------------------------------------------------------
+: > "$WORK/props.want"
+if [ -f "$MODS/rom.json" ]; then
+  python3 - "$MODS/rom.json" >> "$WORK/props.want" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in ("name", "version", "description"):
+    v = str(d.get(k, "")).replace("\n", " ").strip()
+    if v:
+        print("ro.darkrom.%s=%s" % (k, v))
+PY
+fi
+if [ -f "$MODS/props.txt" ]; then
+  clean "$MODS/props.txt" >> "$WORK/props.want"
+fi
+if [ -s "$WORK/props.want" ]; then
+  fs_read "$P/build.prop" "$WORK/build.prop"
+  python3 - "$WORK/build.prop" "$WORK/props.want" "$WORK/expected-props.txt" <<'PY'
+import sys
+bp, want, expected = sys.argv[1:4]
+wanted = {}
+order = []
+for line in open(want, encoding="utf-8"):
+    line = line.strip()
+    if "=" not in line:
+        sys.exit("props: bad line (need key=value): %r" % line)
+    k, v = line.split("=", 1)
+    k, v = k.strip(), v.strip()
+    if k not in wanted:
+        order.append(k)
+    wanted[k] = v
+lines = open(bp, encoding="utf-8", errors="surrogateescape").read().splitlines()
+marker = "# --- DarkROM overrides (scripts/apply-mods) ---"
+if marker in lines:                      # idempotent: drop our old block
+    lines = lines[:lines.index(marker)]
+    while lines and not lines[-1].strip():
+        lines.pop()
+done = set()
+for i, l in enumerate(lines):
+    s = l.strip()
+    if s.startswith("#") or "=" not in s:
+        continue
+    k = s.split("=", 1)[0].strip()
+    if k in wanted:
+        lines[i] = "%s=%s" % (k, wanted[k])
+        done.add(k)
+extra = [k for k in order if k not in done]
+if extra:
+    lines += ["", marker] + ["%s=%s" % (k, wanted[k]) for k in extra]
+open(bp, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(lines) + "\n")
+with open(expected, "w", encoding="utf-8") as f:
+    for k in order:
+        f.write("%s=%s\n" % (k, wanted[k]))
+PY
+  fs_write "$WORK/build.prop" "$P/build.prop"
+  sed 's/^/prop: /' "$WORK/expected-props.txt" >> "$APPLIED"
+else
+  : > "$WORK/expected-props.txt"
+fi
+
+log "applied mods from $MODS:"
+cat "$APPLIED" >&2
