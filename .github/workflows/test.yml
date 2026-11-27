@@ -46,9 +46,9 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm || echo "no /dev/kvm on this runner"
 
-      - name: Cache emulator system image
+      - name: Restore cached emulator system image
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/sysimg-cache
           key: sysimg-${{ env.SYSIMG_REL }}-v1
@@ -78,6 +78,13 @@ jobs:
             echo "$SDK/cmdline-tools/latest/bin"
           } >> "$GITHUB_PATH"
 
+      - name: Save emulator system image to cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/sysimg-cache
+          key: sysimg-${{ env.SYSIMG_REL }}-v1
+
       - name: Build, boot and check
         run: |
           WORK_ROOT=/mnt/darkrom
@@ -102,6 +109,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          mkdir -p results
           [ -f results/summary.md ] || { echo "# DarkROM test: FAIL (no summary produced)" > results/summary.md; }
           gh release delete test-latest --yes --cleanup-tag 2>/dev/null || true
           git push origin :refs/tags/test-latest 2>/dev/null || true
