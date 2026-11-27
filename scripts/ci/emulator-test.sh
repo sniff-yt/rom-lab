@@ -217,7 +217,7 @@ FAILS=0
 : > "$RESULTS/check-props.tsv"
 while IFS='=' read -r k v; do
   [ -n "$k" ] || continue
-  got="$(adb shell getprop "$k" 2>/dev/null | tr -d '\r')"
+  got="$(adb shell getprop "$k" </dev/null 2>/dev/null | tr -d '\r')"
   if [ "$got" = "$v" ]; then r=PASS; else r=FAIL; FAILS=$((FAILS+1)); fi
   printf '%s\t%s\t%s\t%s\n' "$r" "$k" "$v" "${got:-(empty)}" >> "$RESULTS/check-props.tsv"
 done < "$WD/expected-props.txt"
@@ -227,7 +227,7 @@ while read -r path pkg; do
   [ -n "$path" ] || continue
   detail=""
   r=PASS
-  if adb shell "[ -e $path ]" >/dev/null 2>&1; then r=FAIL; detail="path still exists"; fi
+  if adb shell "[ -e $path ]" </dev/null >/dev/null 2>&1; then r=FAIL; detail="path still exists"; fi
   if [ "$pkg" != "-" ] && grep -qx "$pkg" "$RESULTS/packages.txt"; then
     r=FAIL; detail="${detail:+$detail; }package still installed"
   fi
@@ -238,7 +238,7 @@ done < "$WD/expected-removed.txt"
 : > "$RESULTS/check-files.tsv"
 while read -r path sum; do
   [ -n "$path" ] || continue
-  got="$(adb shell sha256sum "$path" 2>/dev/null | tr -d '\r' | cut -d' ' -f1)"
+  got="$(adb shell sha256sum "$path" </dev/null 2>/dev/null | tr -d '\r' | cut -d' ' -f1)"
   if [ "$got" = "$sum" ]; then r=PASS; d="sha256 matches"; else r=FAIL; d="sha256 ${got:-missing}"; FAILS=$((FAILS+1)); fi
   printf '%s\t%s\t%s\n' "$r" "$path" "$d" >> "$RESULTS/check-files.tsv"
 done < "$WD/expected-files.txt"
