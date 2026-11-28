@@ -1,0 +1,256 @@
+name: live
+
+# Builds DarkROM exactly like test.yml (same image tools, cache, SDK and
+# scripts/unpack + apply-mods + repack), boots it with KVM in a visible
+# emulator window on an Xvfb display, and serves that display in the browser
+# with noVNC (touch = click/drag, typing, the emulator toolbar has Back/Home).
+# A cloudflared quick tunnel (trycloudflare.com) exposes it; the VNC password
+# protects it. The tunnel URL (never the password) is published in the body of
+# the "live-session" prerelease, which the Relay Code app reads via the API.
+# Stop early by cancelling the run.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to keep the phone online (max 120)"
+        type: number
+        default: 30
+      pw:
+        description: "VNC password, 8 chars (the app sends a random one). Empty = random, saved as a private artifact."
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: live
+  cancel-in-progress: true
+
+env:
+  SYSIMG_PKG: "system-images;android-34;google_apis;x86_64"
+  SYSIMG_REL: "system-images/android-34/google_apis/x86_64"
+  BOOT_TIMEOUT: "600"
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - name: Password
+        env:
+          IN_PW: ${{ inputs.pw }}
+        run: |
+          set -euo pipefail
+          pw="$IN_PW"
+          if [ -z "$pw" ]; then pw="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)"; echo "GEN_PW=1" >> "$GITHUB_ENV"; fi
+          echo "::add-mask::$pw"
+          mkdir -p "$RUNNER_TEMP/live"
+          printf '%s' "$pw" > "$RUNNER_TEMP/live/pw"
+          chmod 600 "$RUNNER_TEMP/live/pw"
+
+      - name: Upload generated password (private artifact)
+        if: env.GEN_PW == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-password
+          path: ${{ runner.temp }}/live/pw
+          retention-days: 1
+
+      - name: Publish status building
+        run: |
+          gh release delete live-session --yes --cleanup-tag 2>/dev/null || true
+          gh release create live-session --target "$GITHUB_SHA" --prerelease --title "live-session (building)" \
+            --notes "$(printf 'status: building\nrun: %s\nurl: \n' "$GITHUB_RUN_ID")"
+
+      - uses: actions/checkout@v4
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q e2fsprogs android-sdk-libsparse-utils erofs-utils attr \
+            xvfb x11vnc novnc websockify openbox \
+            libxcb-cursor0 libxkbcommon-x11-0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-render-util0 libpulse0 libnss3 libxcomposite1 libxdamage1
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared.deb" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "$RUNNER_TEMP/cloudflared.deb"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h / /mnt || true
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "no /dev/kvm on this runner"
+
+      - name: Restore cached emulator system image
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/sysimg-cache
+          key: sysimg-${{ env.SYSIMG_REL }}-v1
+
+      - name: Install SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null || true
+          "$SM" --install emulator platform-tools >/dev/null
+          if [ -d "$HOME/sysimg-cache/x86_64" ]; then
+            echo "using cached system image"
+            mkdir -p "$SDK/$(dirname "$SYSIMG_REL")"
+            rm -rf "${SDK:?}/$SYSIMG_REL"
+            cp -a "$HOME/sysimg-cache/x86_64" "$SDK/$SYSIMG_REL"
+          else
+            "$SM" --install "$SYSIMG_PKG" >/dev/null
+            mkdir -p "$HOME/sysimg-cache"
+            cp -a "$SDK/$SYSIMG_REL" "$HOME/sysimg-cache/x86_64"
+          fi
+          {
+            echo "$SDK/emulator"
+            echo "$SDK/platform-tools"
+          } >> "$GITHUB_PATH"
+
+      - name: Build DarkROM image
+        run: |
+          set -euo pipefail
+          WORK_ROOT=/mnt/darkrom
+          if ! sudo mkdir -p "$WORK_ROOT" 2>/dev/null; then WORK_ROOT="$RUNNER_TEMP/darkrom"; fi
+          sudo chown "$(id -u):$(id -g)" "$WORK_ROOT" 2>/dev/null || mkdir -p "$WORK_ROOT"
+          WD="$WORK_ROOT/wd"; MODSYS="$WORK_ROOT/sysimg"; SYSIMG_DIR="$SDK/$SYSIMG_REL"
+          echo "MODSYS=$MODSYS" >> "$GITHUB_ENV"
+          scripts/unpack "$SYSIMG_DIR/system.img" "$WD"
+          scripts/apply-mods "$WD" mods
+          rm -rf "$MODSYS"; mkdir -p "$MODSYS"
+          for f in "$SYSIMG_DIR"/*; do
+            case "$(basename "$f")" in
+              system.img|VerifiedBootParams.textproto) ;;
+              *) cp -al "$f" "$MODSYS/" 2>/dev/null || cp -a "$f" "$MODSYS/" ;;
+            esac
+          done
+          scripts/repack "$WD" "$MODSYS/system.img"
+          rm -rf "$WD"
+
+      - name: Boot emulator
+        run: |
+          set -euo pipefail
+          gh release edit live-session --title "live-session (booting)" \
+            --notes "$(printf 'status: booting\nrun: %s\nurl: \n' "$GITHUB_RUN_ID")" || true
+          export ANDROID_AVD_HOME="$HOME/.android/avd"; echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          AVD_DIR="$ANDROID_AVD_HOME/darkrom.avd"; mkdir -p "$AVD_DIR"
+          printf 'avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/darkrom.avd\ntarget=34\n' "$AVD_DIR" > "$ANDROID_AVD_HOME/darkrom.ini"
+          cat > "$AVD_DIR/config.ini" <<EOF
+          AvdId=darkrom
+          avd.ini.displayname=darkrom
+          abi.type=x86_64
+          hw.cpu.arch=x86_64
+          hw.cpu.ncore=4
+          image.sysdir.1=$MODSYS/
+          tag.id=google_apis
+          target=34
+          PlayStore.enabled=false
+          hw.ramSize=3072
+          disk.dataPartition.size=4G
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.keyboard=yes
+          hw.mainKeys=no
+          hw.lcd.width=720
+          hw.lcd.height=1600
+          hw.lcd.density=320
+          hw.audioInput=no
+          hw.audioOutput=no
+          showDeviceFrame=no
+          EOF
+          sed -i 's/^ *//' "$AVD_DIR/config.ini"
+          # Visible window on a virtual display, so noVNC can show and drive it.
+          Xvfb :1 -screen 0 900x1700x24 -nolisten tcp > "$RUNNER_TEMP/live/xvfb.log" 2>&1 &
+          sleep 2
+          DISPLAY=:1 openbox > /dev/null 2>&1 &
+          ACCEL=(-accel on); [ -w /dev/kvm ] || ACCEL=(-accel off)
+          DISPLAY=:1 nohup emulator -avd darkrom -sysdir "$MODSYS" -gpu swiftshader_indirect -no-snapshot \
+            -no-audio -no-boot-anim -camera-back none -camera-front none -wipe-data "${ACCEL[@]}" \
+            > "$RUNNER_TEMP/live/emulator.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/live/emu.pid"
+          adb start-server >/dev/null 2>&1
+          start=$(date +%s)
+          until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
+            kill -0 "$(cat "$RUNNER_TEMP/live/emu.pid")" || { tail -n 80 "$RUNNER_TEMP/live/emulator.log"; exit 1; }
+            [ $(( $(date +%s) - start )) -lt "$BOOT_TIMEOUT" ] || { echo "boot timeout"; tail -n 80 "$RUNNER_TEMP/live/emulator.log"; exit 1; }
+            sleep 5
+          done
+          echo "boot completed in $(( $(date +%s) - start ))s"
+          adb shell svc power stayon true || true
+          adb shell settings put system screen_off_timeout 2147483647 || true
+          adb shell input keyevent 224 || true
+          adb shell wm dismiss-keyguard || true
+          adb shell input keyevent 3 || true
+
+      - name: Start remote screen and tunnel
+        run: |
+          set -euo pipefail
+          L="$RUNNER_TEMP/live"
+          x11vnc -storepasswd "$(cat "$L/pw")" "$L/vncpass" >/dev/null 2>&1
+          x11vnc -display :1 -rfbauth "$L/vncpass" -localhost -forever -shared -noxdamage -rfbport 5900 \
+            -bg -o "$L/x11vnc.log"
+          websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 > "$L/websockify.log" 2>&1 &
+          sleep 2
+          curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 > "$L/cloudflared.log" 2>&1 &
+          echo $! > "$L/cf.pid"
+          url=""
+          for _ in $(seq 1 60); do
+            url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$L/cloudflared.log" | head -n1 || true)"
+            [ -n "$url" ] && break; sleep 2
+          done
+          [ -n "$url" ] || { cat "$L/cloudflared.log"; exit 1; }
+          # wait until the edge actually serves it
+          for _ in $(seq 1 30); do curl -fsS -o /dev/null "$url/vnc.html" && break; sleep 2; done
+          echo "LIVE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Live
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          set -uo pipefail
+          m="${MINUTES:-30}"; m="${m%%.*}"
+          case "$m" in ''|*[!0-9]*) m=30;; esac
+          [ "$m" -ge 1 ] || m=1; [ "$m" -le 120 ] || m=120
+          until_ts=$(( $(date +%s) + m * 60 ))
+          view="$LIVE_URL/vnc.html?autoconnect=1&resize=scale&reconnect=1&show_dot=1"
+          gh release edit live-session --title "live-session (live)" --notes "$(printf 'status: live\nrun: %s\nurl: %s\nexpires: %s\n' \
+            "$GITHUB_RUN_ID" "$view" "$(date -u -d "@$until_ts" +%Y-%m-%dT%H:%M:%SZ)")"
+          {
+            echo "## DarkROM live session"
+            echo
+            echo "- URL: $view (password: the one the app sent)"
+            echo "- Online for $m min, until $(date -u -d "@$until_ts" +%H:%M) UTC. Cancel the run to stop early."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "live at $view for $m min"
+          while [ "$(date +%s)" -lt "$until_ts" ]; do
+            kill -0 "$(cat "$RUNNER_TEMP/live/emu.pid")" 2>/dev/null || { echo "emulator exited"; break; }
+            kill -0 "$(cat "$RUNNER_TEMP/live/cf.pid")" 2>/dev/null || { echo "tunnel exited"; break; }
+            sleep 20
+          done
+
+      - name: Shut down
+        if: always()
+        run: |
+          gh release edit live-session --title "live-session (ended)" \
+            --notes "$(printf 'status: ended\nrun: %s\nurl: \n' "$GITHUB_RUN_ID")" || true
+          adb emu kill >/dev/null 2>&1 || true
+          pkill cloudflared || true
+          pkill -f websockify || true
+          pkill x11vnc || true
+          pkill Xvfb || true
